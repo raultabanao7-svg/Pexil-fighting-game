@@ -1,63 +1,620 @@
-{
-  "name": "anime-fighter",
-  "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "@capacitor/core": "^7.0.0",
-    "@capacitor/android": "^7.0.0"
-  },
-  "devDependencies": {
-    "@capacitor/cli": "^7.0.0"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b0a12">
+<title>Blade Arc</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:#0b0a12;
+    touch-action:none;-webkit-user-select:none;user-select:none;
+    -webkit-tap-highlight-color:transparent;
+    font-family:'Trebuchet MS','Segoe UI',system-ui,sans-serif}
+  canvas{display:block;position:fixed;inset:0;width:100%;height:100%;
+    image-rendering:pixelated;
+    image-rendering:crisp-edges;
+    image-rendering:-moz-crisp-edges}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(()=>{
+"use strict";
+
+/* ============================== CANVAS / LAYOUT ============================== */
+const cv = document.getElementById('c');
+const scr = cv.getContext('2d', {alpha:false});    // blitter
+
+// everything is drawn here at 1/PX resolution, then magnified
+const buf = document.createElement('canvas');
+let ctx = buf.getContext('2d', {alpha:false});
+
+let W=0, H=0;
+let PX = 3;            // screen pixels per game pixel
+let BW = 0, BH = 0;    // buffer size
+let BOX = 0, BOY = 0;  // centering offset
+
+const SCANLINES = true;   // set false to disable the CRT overlay
+
+const ARENA = {w:720, h:400};
+const GROUND = 330;
+
+const view = {scale:1, ox:0, oy:0, gy:0};
+
+function px(x,y,w,h){
+  ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+}
+
+function rr(x,y,w,h,r){
+  x=Math.round(x); y=Math.round(y);
+  w=Math.round(w); h=Math.round(h);
+  if(w<0){ x+=w; w=-w; }
+  if(h<0){ y+=h; h=-h; }
+  ctx.beginPath();
+  ctx.rect(x,y,w,h);
+}
+
+function computeLayout(){
+  const reserve = Math.min(H*0.20, 150);
+  const s = Math.min(W/ARENA.w, (H-reserve)/ARENA.h);
+  view.scale = s;
+  view.ox = (W - ARENA.w*s)/2;
+  view.oy = Math.max(6, (H - reserve) - ARENA.h*s);
+  view.gy = view.oy + GROUND*s;
+  layoutControls();
+  layoutMenu();
+  layoutSelect();
+  layoutTrain();
+}
+
+function resize(){
+  W = window.innerWidth;
+  H = window.innerHeight;
+
+  PX = clamp(Math.round(W / 420), 2, 6);
+  if(H / PX < 150) PX = clamp(Math.round(H / 150), 2, 6);
+
+  BW = Math.ceil(W / PX);
+  BH = Math.ceil(H / PX);
+
+  buf.width  = BW;
+  buf.height = BH;
+  cv.width   = W;
+  cv.height  = H;
+
+  scr.imageSmoothingEnabled = false;
+
+  ctx.setTransform(1/PX, 0, 0, 1/PX, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+
+  BOX = Math.floor((W - BW*PX) / 2);
+  BOY = Math.floor((H - BH*PX) / 2);
+
+  computeLayout();
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', ()=>setTimeout(resize,120));
+
+/* ============================== AUDIO ============================== */
+let AC = null;
+function audio(){
+  if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ AC=false; } }
+  if(AC && AC.state === 'suspended') AC.resume();
+  return AC;
+}
+function tone(freq, freq2, dur, type, vol){
+  const ac = audio(); if(!ac) return;
+  const t = ac.currentTime;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type||'square';
+  o.frequency.setValueAtTime(freq, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(20,freq2), t+dur);
+  g.gain.setValueAtTime(vol||0.08, t);
+  g.gain.exponentialRampToValueAtTime(0.0008, t+dur);
+  o.connect(g); g.connect(ac.destination);
+  o.start(t); o.stop(t+dur+0.02);
+}
+const SFX = {
+  hit:    ()=>{ tone(300,70,0.10,'square',0.10); tone(900,200,0.05,'sawtooth',0.04); },
+  heavy:  ()=>{ tone(200,50,0.18,'square',0.13); tone(600,120,0.10,'sawtooth',0.06); },
+  block:  ()=>{ tone(1400,700,0.06,'triangle',0.07); },
+  jump:   ()=>{ tone(420,760,0.08,'sine',0.05); },
+  super:  ()=>{ tone(180,1400,0.45,'sawtooth',0.10); tone(90,600,0.5,'sine',0.07); },
+  ko:     ()=>{ tone(160,40,0.7,'sawtooth',0.14); },
+  ui:     ()=>{ tone(700,1200,0.07,'triangle',0.06); }
+};
+
+/* ============================== MATH HELPERS ============================== */
+const rand=(a,b)=>a+Math.random()*(b-a);
+const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+const lerp=(a,b,t)=>a+(b-a)*t;
+const dist2=(x1,y1,x2,y2)=>{const dx=x2-x1,dy=y2-y1;return dx*dx+dy*dy;};
+const overlap=(a,b)=>a.x<b.x+b.w && a.x+a.w>b.x && a.y<b.y+b.h && a.y+a.h>b.y;
+
+/* ============================== MOVES ============================== */
+const MOVES = {
+  light: {startup:4,  active:5, recovery:10, dmg:5,  fx:12, hw:54, hy:-112, hh:40, kb:2.4, hitstun:14, blockstun:9,  push:3.0, meterGain:7,  chip:0.18},
+  heavy: {startup:9,  active:6, recovery:19, dmg:12, fx:8,  hw:70, hy:-104, hh:56, kb:6.2, hitstun:22, blockstun:14, push:7.5, meterGain:11, chip:0.20},
+  special:{startup:16, active:4, recovery:26, dmg:0, fx:0, hw:0, hy:0, hh:0, kb:0, hitstun:0, blockstun:0, push:0, meterGain:0, chip:0}
+};
+const ORB_HIT = {dmg:18, kb:8.5, hitstun:28, blockstun:18, push:11, meterGain:0, chip:0.16};
+
+/* ============================== CHARACTERS ============================== */
+const CHARS = {
+  kaito: {name:'KAITO', skin:'#f3c9a2', hair:'#2f5fd0', hair2:'#5c8df5',
+          outfit:'#eef3fb', outfit2:'#26324c', accent:'#5fd8ff', trim:'#1b2236', eye:'#1b2236',
+          pony:false},
+  rei:   {name:'REI',   skin:'#f1c6a9', hair:'#241220', hair2:'#c0304a',
+          outfit:'#161620', outfit2:'#7d1c2e', accent:'#ff4d6a', trim:'#c0304a', eye:'#ff4d6a',
+          pony:false},
+  sora:  {name:'SORA',  skin:'#f7d7bd', hair:'#1e1436', hair2:'#8a5cf5',
+          outfit:'#16281c', outfit2:'#2f4f34', accent:'#7cf5a8', trim:'#0e1a12', eye:'#7cf5a8',
+          pony:true}
+};
+const ROSTER = ['kaito','rei','sora'];
+
+/* ============================== INPUT ============================== */
+const controls = {
+  stick: {cx:0, cy:0, r:52, id:null, dx:0, dy:0},
+  buttons: []
+};
+
+function layoutControls(){
+  const br = clamp(W*0.072, 26, 40);
+  const gap = br*0.30;
+  const bx  = W - 22 - br;
+  const bx2 = bx - 2*br - gap;
+  const by  = H - 22 - br;
+  const by2 = by - 2*br - gap;
+
+  controls.buttons = [
+    {id:'special', label:'S', x:bx2, y:by2, r:br, active:false, tid:null, col:'#ffd45e'},
+    {id:'heavy',   label:'H', x:bx,  y:by2, r:br, active:false, tid:null, col:'#ff8a5c'},
+    {id:'light',   label:'L', x:bx2, y:by,  r:br, active:false, tid:null, col:'#5fd8ff'},
+    {id:'block',   label:'B', x:bx,  y:by,  r:br, active:false, tid:null, col:'#9aa7c7'}
+  ];
+  controls.stick.r = br*1.45;
+  controls.stick.cx = 22 + controls.stick.r;
+  controls.stick.cy = H - 22 - controls.stick.r;
+}
+
+const KB = {};
+window.addEventListener('keydown', e=>{
+  const k = e.key.length===1 ? e.key.toLowerCase() : e.key;
+  KB[k]=true; e.preventDefault(); audio();
+});
+window.addEventListener('keyup', e=>{
+  const k = e.key.length===1 ? e.key.toLowerCase() : e.key;
+  KB[k]=false;
+});
+
+function hitBtn(b, x, y){ return x>=b.x && x<=b.x+b.w && y>=b.y && y<=b.y+b.h; }
+
+function onStart(e){
+  e.preventDefault(); audio();
+
+  /* ---------- MENU ---------- */
+  if(match.screen === 'menu'){
+    for(const t of e.changedTouches){
+      for(const b of menuBtns){
+        if(hitBtn(b, t.clientX, t.clientY)){
+          SFX.ui();
+          match.mode = (b.id === 'train') ? 'training' : 'vs';
+          match.selectedP = 'kaito';
+          match.screen = 'select';
+          return;
+        }
+      }
+    }
+    return;
+  }
+
+  /* ---------- SELECT ---------- */
+  if(match.screen === 'select'){
+    for(const t of e.changedTouches){
+      for(const b of selectBtns){
+        if(!hitBtn(b, t.clientX, t.clientY)) continue;
+        SFX.ui();
+        if(b.key){ match.selectedP = b.key; return; }
+        if(b.id === 'back'){ match.screen = 'menu'; return; }
+        if(b.id === 'start'){ beginMatch(); return; }
+      }
+    }
+    return;
+  }
+
+  /* ---------- TRAINING OVERLAY ---------- */
+  if(match.screen === 'fight' && match.mode === 'training'){
+    for(const t of e.changedTouches){
+      for(const b of trainBtns){
+        if(!hitBtn(b, t.clientX, t.clientY)) continue;
+        SFX.ui();
+        if(b.id === 'reset'){ trainReset(); }
+        if(b.id === 'dummy'){ match.dummyMode = match.dummyMode==='block' ? 'stand' : 'block'; layoutTrain(); }
+        if(b.id === 'hitbox'){ match.showHitboxes = !match.showHitboxes; layoutTrain(); }
+        if(b.id === 'menu'){ match.screen = 'menu'; layoutMenu(); }
+        return;
+      }
+    }
+  }
+
+  /* ---------- FIGHT INPUT ---------- */
+  for(const t of e.changedTouches){
+    const px=t.clientX, py=t.clientY;
+    const st = controls.stick;
+    if(st.id===null && dist2(px,py,st.cx,st.cy) < (st.r*1.7)*(st.r*1.7)){
+      st.id = t.identifier;
+      updateStick(px,py);
+      continue;
+    }
+    for(const b of controls.buttons){
+      if(b.tid===null && dist2(px,py,b.x,b.y) < (b.r*1.30)*(b.r*1.30)){
+        b.tid = t.identifier; b.active = true; break;
+      }
+    }
   }
 }
-{
-  "appId": "com.you.animefighter",
-  "appName": "AnimeFighter",
-  "webDir": "www"
+function onMove(e){
+  e.preventDefault();
+  const st = controls.stick;
+  for(const t of e.changedTouches){
+    if(t.identifier === st.id){ updateStick(t.clientX, t.clientY); }
+    else {
+      for(const b of controls.buttons){
+        if(b.tid === t.identifier){
+          b.active = dist2(t.clientX,t.clientY,b.x,b.y) < (b.r*1.55)*(b.r*1.55);
+        }
+      }
+    }
+  }
 }
-name: Build APK
+function onEnd(e){
+  e.preventDefault();
+  const st = controls.stick;
+  for(const t of e.changedTouches){
+    if(t.identifier === st.id){ st.id=null; st.dx=0; st.dy=0; }
+    for(const b of controls.buttons){
+      if(b.tid === t.identifier){ b.tid=null; b.active=false; }
+    }
+  }
+}
+function updateStick(px,py){
+  const st = controls.stick;
+  const dx = (px - st.cx)/st.r, dy = (py - st.cy)/st.r;
+  const m = Math.hypot(dx,dy);
+  if(m > 1){ st.dx = dx/m; st.dy = dy/m; } else { st.dx = dx; st.dy = dy; }
+}
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+cv.addEventListener('touchstart', onStart, {passive:false});
+cv.addEventListener('touchmove',  onMove,  {passive:false});
+cv.addEventListener('touchend',   onEnd,   {passive:false});
+cv.addEventListener('touchcancel',onEnd,   {passive:false});
+cv.addEventListener('mousedown', ()=>{ audio(); restartIfOver(); });
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+let prevLight=false, prevHeavy=false, prevSpecial=false;
+function readInput(){
+  const st = controls.stick;
+  const B = id => controls.buttons.find(b=>b.id===id);
+  const dz = 0.30;
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  const light   = B('light').active   || !!KB['j'];
+  const heavy   = B('heavy').active   || !!KB['k'];
+  const block   = B('block').active   || !!KB['l'];
+  const special = B('special').active || !!KB['i'];
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+  const inp = {
+    left:  st.dx < -dz || !!KB['a'] || !!KB['ArrowLeft'],
+    right: st.dx >  dz || !!KB['d'] || !!KB['ArrowRight'],
+    up:    st.dy < -0.45|| !!KB['w'] || !!KB['ArrowUp'],
+    down:  st.dy >  0.45|| !!KB['s'] || !!KB['ArrowDown'],
+    block: block,
+    light: light,
+    heavy: heavy,
+    special: special,
+    lightEdge:   light   && !prevLight,
+    heavyEdge:   heavy   && !prevHeavy,
+    specialEdge: special && !prevSpecial
+  };
+  prevLight = light; prevHeavy = heavy; prevSpecial = special;
+  return inp;
+}
 
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
+/* ============================== PARTICLES / FX ============================== */
+const parts = [];
+const popups = [];
+let shakeMag = 0, shakeT = 0;
+let hitStop = 0;
 
-      - name: Install dependencies
-        run: npm install
+function burst(x,y,n,color,spd,life){
+  spd = spd||6; life = life||30;
+  for(let i=0;i<n;i++){
+    const a = Math.random()*Math.PI*2;
+    const s = Math.random()*spd + 1.2;
+    parts.push({x,y,vx:Math.cos(a)*s, vy:Math.sin(a)*s - 1.1,
+      life:rand(life*0.6,life), max:life, color, r:rand(2,5.5), grav:0.25});
+  }
+}
+function ring(x,y,color,maxR){
+  parts.push({ring:true,x,y,r:4,maxR:maxR||60,life:18,max:18,color});
+}
+function popup(x,y,text,color,size){
+  popups.push({x,y,text,color:color||'#fff',size:size||16,life:48,vy:-1.25});
+}
+function shake(m){ shakeMag = Math.max(shakeMag, m); shakeT = 12; }
+function clearFX(){ parts.length=0; popups.length=0; shakeMag=0; shakeT=0; hitStop=0; }
 
-      - name: Add Android platform
-        run: npx cap add android
+/* ============================== FIGHTER ============================== */
+class Fighter{
+  constructor(key, x, facing, isPlayer){
+    this.cfg = CHARS[key];
+    this.x = x; this.y = GROUND;
+    this.vx = 0; this.vy = 0;
+    this.facing = facing;
+    this.startX = x; this.startFacing = facing;
+    this.maxhp = 100; this.hp = 100;
+    this.meter = 0;
+    this.onGround = true;
+    this.crouch = false;
+    this.blocking = false;
+    this.attack = null;
+    this.hitstun = 0;
+    this.blockstun = 0;
+    this.flash = 0;
+    this.anim = 0;
+    this.combo = 0;
+    this.comboT = 0;
+    this.dead = false;
+    this.koRot = 0;
+    this.koVr = 0;
+    this.juggle = 0;
+    this.isPlayer = isPlayer;
+    this.auraT = 0;
+    this.input = {};
+  }
 
-      - name: Sync web code to Android
-        run: npx cap sync android
+  reset(x, facing){
+    this.x = x; this.y = GROUND; this.vx = 0; this.vy = 0;
+    this.facing = facing;
+    this.hp = this.maxhp; this.meter = 0;
+    this.onGround = true; this.crouch = false; this.blocking = false;
+    this.attack = null; this.hitstun = 0; this.blockstun = 0;
+    this.flash = 0; this.combo = 0; this.comboT = 0;
+    this.dead = false; this.koRot = 0; this.koVr = 0;
+    this.anim = 0; this.auraT = 0; this.juggle = 0;
+  }
 
-      - name: Build debug APK
-        run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleDebug
+  canAct(){ return !this.dead && this.hitstun<=0 && this.blockstun<=0 && !this.attack; }
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-debug
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+  startAttack(name){
+    if(this.attack) return;
+    if(name === 'special'){
+      if(this.meter < 50) return;
+      if(!this.onGround) return;
+      this.meter -= 50;
+      SFX.super();
+      ring(this.x, this.y-80, this.cfg.accent, 90);
+      shake(5);
+    }
+    this.attack = {
+      name, move: MOVES[name], frame:0, hit:false, spawned:false,
+      air: !this.onGround
+    };
+    if(name !== 'special') SFX.jump();
+  }
+
+  update(foe){
+    this.anim++;
+    if(this.flash > 0) this.flash--;
+    if(this.comboT > 0){ this.comboT--; if(this.comboT===0) this.combo = 0; }
+    if(this.hitstun > 0) this.hitstun--;
+    if(this.blockstun > 0) this.blockstun--;
+
+    // ---- KO physics ----
+    if(this.dead){
+      this.koVr += 0.012;
+      this.koRot = Math.min(this.koRot + this.koVr, 1.45);
+      this.vx *= 0.90;
+      this.x += this.vx;
+      this.x = clamp(this.x, 34, ARENA.w-34);
+      return;
+    }
+
+    // ---- gravity ----
+    this.vy += 0.62;
+    this.y += this.vy;
+    if(this.y >= GROUND){
+      this.y = GROUND; this.vy = 0; this.onGround = true;
+      this.juggle = 0;                    // ← landing resets juggle counter
+    } else {
+      this.onGround = false;
+    }
+
+    // ---- attack timeline ----
+    if(this.attack){
+      const a = this.attack, m = a.move;
+      a.frame++;
+      if(a.name === 'special' && a.frame === m.startup && !a.spawned){
+        a.spawned = true;
+        spawnOrb(this);
+      }
+      if(a.frame >= m.startup + m.active + m.recovery) this.attack = null;
+    }
+
+    const inp = this.input || {};
+    const free = this.canAct();
+
+    // ---- auto-face ----
+    if(!this.attack && this.hitstun<=0 && this.blockstun<=0){
+      this.facing = (foe.x >= this.x) ? 1 : -1;
+    }
+
+    // ---- block / attack ----
+    this.blocking = false;
+    this.crouch = false;
+
+    if(free){
+      if(inp.block && this.onGround){       // no air-blocking
+        this.blocking = true;
+        this.crouch = !!inp.down;
+      } else {
+        if(inp.light)             this.startAttack('light');
+        else if(inp.heavy)        this.startAttack('heavy');
+        else if(inp.special && this.onGround) this.startAttack('special');
+      }
+    }
+
+    // ---- movement ----
+    let move = 0;
+    if(free && !this.blocking){
+      if(inp.left)  move -= 1;
+      if(inp.right) move += 1;
+      if(inp.down)  this.crouch = true;
+
+      if(inp.up && this.onGround){
+        this.vy = -11.4;
+        this.onGround = false;
+        SFX.jump();
+        burst(this.x, this.y, 6, '#ffffff', 3, 16);
+      }
+    }
+
+    if(this.attack){
+      this.vx *= 0.86;
+      if(!this.onGround){
+        this.vy *= 0.90;                    // hover while swinging
+        if(this.vy > 0) this.vy *= 0.94;
+      }
+    } else if(this.hitstun > 0 || this.blockstun > 0){
+      this.vx *= 0.90;
+    } else if(!this.onGround){
+      if(move !== 0) this.vx = lerp(this.vx, move*3.0, 0.10);
+    } else if(this.blocking){
+      if(move !== 0) this.vx = move * 1.5; else this.vx *= 0.7;
+    } else {
+      const spd = this.crouch ? 0 : 3.6;
+      if(move !== 0) this.vx = move * spd;
+      else this.vx *= 0.62;
+    }
+
+    this.x += this.vx;
+    this.x = clamp(this.x, 34, ARENA.w-34);
+
+    // ---- aura when meter full ----
+    if(this.meter >= 50){
+      this.auraT++;
+      if(this.auraT % 3 === 0){
+        parts.push({
+          x: this.x + rand(-24,24), y: this.y - rand(0,10),
+          vx: rand(-0.4,0.4), vy: rand(-2.6,-1.2),
+          life: 26, max: 26, color: this.cfg.accent, r: rand(1.5,3.2), grav: -0.02
+        });
+      }
+    }
+  }
+}
+
+/* ============================== HITBOXES ============================== */
+function attackBox(f, m){
+  if(!f.onGround){
+    // jump-in hitbox: hangs forward and downward
+    const x = f.facing > 0 ? f.x + 6 : f.x - 6 - m.hw;
+    return {x, y: f.y - 22, w: m.hw, h: 62};
+  }
+  const x = f.facing > 0 ? f.x + m.fx : f.x - m.fx - m.hw;
+  return {x, y: f.y + m.hy, w: m.hw, h: m.hh};
+}
+function hurtBox(f){
+  const h = f.crouch ? 76 : 116;
+  const w = 50;
+  return {x: f.x - w/2, y: f.y - h, w, h};
+}
+
+function applyHit(a, d, m, dir){
+  if(d.dead) return;
+
+  const facingEachOther = (d.facing !== a.facing);
+  const blocked = d.blocking && d.onGround && facingEachOther && dir === a.facing;
+
+  const cx = d.x + dir*10;
+  const cy = d.y - 80;
+
+  if(blocked){
+    const dmg = Math.max(1, Math.round(m.dmg * (m.chip||0.18)));
+    d.hp = Math.max(0, d.hp - dmg);
+    d.blockstun = m.blockstun;
+    d.vx = dir * m.push * 0.5;
+    a.meter = Math.min(100, a.meter + (m.meterGain||6)*0.4);
+    d.meter = Math.min(100, d.meter + (m.meterGain||6)*0.7);
+    burst(cx, cy, 10, '#bcd6ff', 5, 18);
+    ring(cx, cy, '#8fb6ff', 34);
+    popup(cx, cy-14, 'BLOCK', '#9ec2ff', 12);
+    SFX.block();
+    shake(3);
+    hitStop = Math.max(hitStop, 3);
+  } else {
+    const air = !d.onGround;
+    const jug = d.juggle || 0;
+
+    d.hp = Math.max(match.mode==='training'?1:0, d.hp - m.dmg);
+    d.flash = 8;
+    if(d.attack) d.attack = null;
+
+    if(air){
+      // ---- JUGGLE: pop the victim up, decay with each hit ----
+      d.juggle = jug + 1;
+      const decay = Math.min(0.65, jug * 0.11);
+      d.hitstun  = Math.max(7, Math.round(m.hitstun * (0.70 - decay)));
+      d.vx       = dir * m.kb * (0.70 - decay*0.5);
+      const pop  = (2.4 + m.dmg * 0.30) * (1 - decay*0.9);
+      d.vy       = Math.min(d.vy, -pop);
+      popup(cx, cy - 22, 'AIR', '#9ef5c8', 12);
+    } else {
+      d.hitstun = m.hitstun;
+      d.vx      = dir * m.kb;
+      d.juggle  = 0;
+    }
+
+    a.meter = Math.min(100, a.meter + (m.meterGain||6));
+    d.meter = Math.min(100, d.meter + (m.meterGain||6)*0.55);
+
+    const heavy = m.dmg >= 10;
+    burst(cx, cy, heavy?22:13, heavy?'#ffd45e':'#ffffff', heavy?8:5.5, heavy?30:22);
+    burst(cx, cy, heavy?10:5, a.cfg.accent, heavy?6:4, 24);
+    ring(cx, cy, heavy?'#ffb020':'#ffffff', heavy?70:44);
+    popup(cx, cy-10, '-'+m.dmg, heavy?'#ffb020':'#ffffff', heavy?20:15);
+    SFX[heavy?'heavy':'hit']();
+    shake(heavy?9:5);
+    hitStop = Math.max(hitStop, heavy?7:4);
+
+    a.combo++;
+    a.comboT = 90;
+    if(a.combo >= 2) popup(a.x, a.y-140, a.combo+' HIT COMBO', '#ffd45e', 14);
+  }
+
+  if(d.hp <= 0 && match.mode !== 'training') onKO(d);
+}
+
+function checkHits(a, d){
+  if(!a.attack || a.attack.hit || d.dead) return;
+  const m = a.attack.move;
+  if(m.hw <= 0) return;
+  const fr = a.attack.frame;
+  if(fr < m.startup || fr >= m.startup + m.active) return;
+  const hb = attackBox(a, m);
+  const hu = hurtBox(d);
+  if(!overlap(hb, hu)) return;
+  a.attack.hit = true;
+  applyHit(a, d, m, a.facing);
+}
+
+/* ============================== PROJECTILES ============================== */
+const orbs = [];
+function spawnOrb(f){
+  orbs.push({
+    owner:f, x: f.x + f.facing*42, y: f.y - 84,
+    dir: f.facing, vx: f.facing*7.8, r:21, life:150, t:0, dead:false, trail:[]
+  });
+  burst(f.x + f.facing*42, f.y-84, 16, f.cfg.acc
